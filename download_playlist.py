@@ -2,11 +2,9 @@
 """
 YouTube / YouTube Music – Downloader por PLAYLIST con menú, progreso por pistas y deduplicación (car-friendly)
 
-• Guarda DIRECTO en carpeta con nombre de la playlist (sin __inbox__)
 • Progreso por cantidad de playlists y por cantidad de canciones de cada playlist
 • MP3 CBR 192 kbps @ 44.1 kHz + ID3v2.3 (compatible con autoradios)
 • Nombres seguros sin acentos/raros (mejor para USB/FAT y radios)
-• Salta videos no disponibles sin romper el flujo
 • Auto-USB (Windows API) + selector manual
 • Deduplicación por hash de audio + listas .m3u por carpeta
 """
