@@ -19,7 +19,7 @@ We take security seriously. If you discover a security vulnerability in YT Music
 
 Instead, please:
 
-1. **Email us** at: [security@your-domain.com] (replace with actual email)
+1. **Email us** at: [charlie.act7@gmail.com] (charlie.act7@gmail.com)
 2. **Use GitHub Security Advisories**: Go to the repository → Security tab → "Report a vulnerability"
 
 ### 📋 What to Include
