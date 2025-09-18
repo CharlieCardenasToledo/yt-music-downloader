@@ -1,0 +1,17 @@
+# Core dependencies
+yt-dlp>=2023.12.30
+typer[all]>=0.9.0
+rich>=13.0.0
+psutil>=5.9.0
+
+# Audio processing
+# Note: ffmpeg must be installed separately on the system
+# See installation instructions in README.md
+
+# Optional but recommended for better performance
+mutagen>=1.47.0
+
+# Development dependencies (uncomment if needed)
+# pytest>=7.0.0
+# black>=23.0.0
+# flake8>=6.0.0
