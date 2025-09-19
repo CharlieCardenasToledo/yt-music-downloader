@@ -22,6 +22,9 @@ import ctypes
 import string
 import unicodedata
 import time
+import socket
+import signal
+import threading
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 from functools import wraps
@@ -50,15 +53,192 @@ app = typer.Typer(add_completion=False, no_args_is_help=False)
 console = Console()
 
 CONFIG_PATH = Path.home() / ".ytmusic-dl.json"
+STATE_PATH = Path.home() / ".ytmusic-dl-state.json"
 DEFAULT_OPTS = {
     "audio_format": "mp3",
     "audio_quality": "192",
     "output_base": str((Path.cwd() / "downloads").resolve()),
     "generate_m3u": True,
+    "auto_resume": True,
+    "connectivity_check": True,
 }
+
+# Estados de descarga
+class DownloadState:
+    PENDING = "pending"
+    DOWNLOADING = "downloading"
+    COMPLETED = "completed"
+    PAUSED = "paused"
+    ERROR = "error"
+    SKIPPED = "skipped"
 
 YTM_PLAYLIST_RE = re.compile(r"^https?://(music\.)?youtube\.com/playlist\?list=", re.IGNORECASE)
 YT_PLAYLIST_RE = re.compile(r"^https?://(www\.)?youtube\.com/playlist\?list=", re.IGNORECASE)
+
+# ---------------------- Control de conectividad y pausa ----------------------
+
+class DownloadController:
+    """Controlador para pausar/reanudar descargas y verificar conectividad."""
+    
+    def __init__(self):
+        self.paused = False
+        self.should_stop = False
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # Inicialmente no pausado
+        
+    def pause(self):
+        """Pausa las descargas."""
+        self.paused = True
+        self._pause_event.clear()
+        console.print("[yellow]⏸️ Descarga pausada por el usuario[/yellow]")
+        
+    def resume(self):
+        """Reanuda las descargas."""
+        self.paused = False
+        self._pause_event.set()
+        console.print("[green]▶️ Descarga reanudada[/green]")
+        
+    def stop(self):
+        """Detiene completamente las descargas."""
+        self.should_stop = True
+        self._pause_event.set()  # Permitir que continúe para que pueda detenerse
+        console.print("[red]⏹️ Deteniendo descarga...[/red]")
+        
+    def wait_if_paused(self):
+        """Espera si está pausado o retorna si debe detenerse."""
+        if self.should_stop:
+            return False
+        if self.paused:
+            console.print("[yellow]⏸️ Descarga pausada. Presiona 'r' para reanudar o 's' para detener.[/yellow]")
+        self._pause_event.wait()
+        return not self.should_stop
+        
+    def is_running(self):
+        """Verifica si la descarga debe continuar."""
+        return not self.should_stop and self.wait_if_paused()
+
+# Instancia global del controlador
+download_controller = DownloadController()
+
+def check_internet_connection(timeout: int = 5) -> bool:
+    """Verifica la conectividad a internet."""
+    try:
+        # Intentar conectar a DNS público de Google
+        socket.create_connection(("8.8.8.8", 53), timeout)
+        return True
+    except (socket.timeout, socket.gaierror, OSError):
+        try:
+            # Intentar con DNS de Cloudflare como backup
+            socket.create_connection(("1.1.1.1", 53), timeout)
+            return True
+        except (socket.timeout, socket.gaierror, OSError):
+            return False
+
+def wait_for_internet_connection(max_wait_time: int = 300) -> bool:
+    """Espera hasta que se restablezca la conexión a internet."""
+    start_time = time.time()
+    check_interval = 5  # segundos
+    
+    while time.time() - start_time < max_wait_time:
+        if check_internet_connection():
+            console.print("[green]✅ Conexión a internet restablecida[/green]")
+            return True
+            
+        elapsed = int(time.time() - start_time)
+        remaining = max_wait_time - elapsed
+        console.print(f"[yellow]🌐 Sin conexión. Reintentando en {check_interval}s... (quedan {remaining}s)[/yellow]")
+        
+        # Verificar si el usuario quiere pausar/detener durante la espera
+        if not download_controller.is_running():
+            return False
+            
+        time.sleep(check_interval)
+    
+    console.print("[red]❌ Tiempo de espera agotado. No se pudo restablecer la conexión.[/red]")
+    return False
+
+def setup_signal_handlers():
+    """Configura manejadores de señales para pausar/reanudar."""
+    def signal_handler(signum, frame):
+        if signum == signal.SIGUSR1:  # Señal personalizada para pausar
+            if download_controller.paused:
+                download_controller.resume()
+            else:
+                download_controller.pause()
+        elif signum == signal.SIGINT:  # Ctrl+C
+            download_controller.stop()
+            
+    if platform.system() != "Windows":
+        signal.signal(signal.SIGUSR1, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+# ---------------------- Guardado y carga de estado ----------------------
+
+def save_download_state(state_data: Dict[str, Any]) -> bool:
+    """Guarda el estado actual de descarga."""
+    try:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Crear backup si existe
+        if STATE_PATH.exists():
+            backup_path = STATE_PATH.with_suffix('.json.backup')
+            shutil.copy2(STATE_PATH, backup_path)
+        
+        # Agregar timestamp
+        state_data["last_updated"] = time.time()
+        state_data["version"] = "1.0"
+        
+        STATE_PATH.write_text(json.dumps(state_data, indent=2, ensure_ascii=False), encoding='utf-8')
+        return True
+        
+    except Exception as e:
+        console.print(f"[yellow]⚠️ Error guardando estado: {e}[/yellow]")
+        return False
+
+def load_download_state() -> Dict[str, Any]:
+    """Carga el estado de descarga guardado."""
+    if not STATE_PATH.exists():
+        return {}
+    
+    try:
+        content = STATE_PATH.read_text(encoding='utf-8')
+        if not content.strip():
+            return {}
+            
+        state = json.loads(content)
+        if not isinstance(state, dict):
+            return {}
+            
+        return state
+        
+    except (json.JSONDecodeError, OSError) as e:
+        console.print(f"[yellow]⚠️ Error cargando estado: {e}[/yellow]")
+        return {}
+
+def clear_download_state() -> bool:
+    """Limpia el estado de descarga guardado."""
+    try:
+        if STATE_PATH.exists():
+            STATE_PATH.unlink()
+        return True
+    except Exception as e:
+        console.print(f"[yellow]⚠️ Error limpiando estado: {e}[/yellow]")
+        return False
+
+def should_resume_download() -> bool:
+    """Verifica si hay una descarga pendiente de reanudar."""
+    state = load_download_state()
+    if not state:
+        return False
+        
+    # Verificar si hay playlists pendientes o en progreso
+    playlists = state.get("playlists", {})
+    for playlist_data in playlists.values():
+        tracks = playlist_data.get("tracks", {})
+        for track_data in tracks.values():
+            if track_data.get("status") in [DownloadState.PENDING, DownloadState.DOWNLOADING, DownloadState.PAUSED]:
+                return True
+    return False
 
 # ---------------------- Decoradores y Utilidades ----------------------
 
@@ -582,20 +762,140 @@ def handle_duplicates(base: Path, move_to_folder: str = "_duplicates") -> int:
         console.print(f"[red]❌ Error procesando duplicados: {e}[/red]")
         return 0
 
+# ---------------------- M3U mejorado con enlace global ----------------------
+
+def update_global_m3u(base_path: Path, playlist_dir: Path, playlist_title: str):
+    """Actualiza o crea un archivo M3U global que enlaza todas las playlists."""
+    try:
+        global_m3u = base_path / "all_playlists.m3u"
+        playlist_m3u = playlist_dir / f"{playlist_dir.name}.m3u"
+        
+        # Leer el M3U global existente si existe
+        existing_entries = set()
+        if global_m3u.exists():
+            try:
+                existing_content = global_m3u.read_text(encoding='utf-8', errors='ignore')
+                existing_entries = set(line.strip() for line in existing_content.splitlines() if line.strip())
+            except Exception:
+                pass
+        
+        # Agregar entrada para esta playlist si no existe
+        playlist_entry = f"{playlist_dir.name}/{playlist_dir.name}.m3u"
+        if playlist_entry not in existing_entries and playlist_m3u.exists():
+            existing_entries.add(playlist_entry)
+            
+            # Escribir M3U global actualizado
+            sorted_entries = sorted(existing_entries)
+            global_content = "\n".join(sorted_entries)
+            global_m3u.write_text(global_content, encoding='utf-8', errors='ignore')
+            
+            console.print(f"[green]📝 M3U global actualizado con '{playlist_title}'[/green]")
+            
+    except Exception as e:
+        console.print(f"[yellow]⚠️ Error actualizando M3U global: {e}[/yellow]")
+
+def create_master_m3u(base_path: Path):
+    """Crea un archivo M3U maestro que incluye todas las canciones de todas las playlists."""
+    try:
+        master_m3u = base_path / "todas_las_canciones.m3u"
+        all_songs = []
+        
+        # Recopilar todas las canciones de todas las carpetas
+        for playlist_dir in sorted(base_path.iterdir()):
+            if playlist_dir.is_dir() and not playlist_dir.name.startswith("_"):
+                mp3_files = sorted(playlist_dir.glob("*.mp3"))
+                for mp3_file in mp3_files:
+                    # Ruta relativa desde el archivo M3U maestro
+                    relative_path = f"{playlist_dir.name}/{mp3_file.name}"
+                    all_songs.append(relative_path)
+        
+        if all_songs:
+            # Crear contenido con metadatos
+            content = "#EXTM3U\n"
+            content += f"#EXTINF:-1,Todas las canciones ({len(all_songs)} tracks)\n"
+            content += "\n".join(all_songs)
+            
+            master_m3u.write_text(content, encoding='utf-8', errors='ignore')
+            console.print(f"[green]🎵 M3U maestro creado con {len(all_songs)} canciones[/green]")
+            
+    except Exception as e:
+        console.print(f"[yellow]⚠️ Error creando M3U maestro: {e}[/yellow]")
+
+def update_all_m3u_files(base_path: Path):
+    """Actualiza todos los archivos M3U después de una descarga completa."""
+    try:
+        console.print("[cyan]📝 Actualizando archivos M3U...[/cyan]")
+        
+        # Actualizar M3U individual de cada playlist
+        write_all_m3u(base_path)
+        
+        # Crear M3U maestro con todas las canciones
+        create_master_m3u(base_path)
+        
+        # Crear M3U de índice de playlists
+        create_playlist_index_m3u(base_path)
+        
+        console.print("[green]✅ Todos los archivos M3U actualizados[/green]")
+        
+    except Exception as e:
+        console.print(f"[yellow]⚠️ Error actualizando M3U: {e}[/yellow]")
+
+def create_playlist_index_m3u(base_path: Path):
+    """Crea un índice M3U que lista todas las playlists disponibles."""
+    try:
+        index_m3u = base_path / "indice_playlists.m3u"
+        playlists = []
+        
+        # Encontrar todas las carpetas de playlists
+        for playlist_dir in sorted(base_path.iterdir()):
+            if playlist_dir.is_dir() and not playlist_dir.name.startswith("_"):
+                playlist_m3u = playlist_dir / f"{playlist_dir.name}.m3u"
+                if playlist_m3u.exists():
+                    # Contar canciones en la playlist
+                    mp3_count = len(list(playlist_dir.glob("*.mp3")))
+                    if mp3_count > 0:
+                        playlists.append((playlist_dir.name, mp3_count, f"{playlist_dir.name}/{playlist_dir.name}.m3u"))
+        
+        if playlists:
+            content = "#EXTM3U\n"
+            content += "#PLAYLIST:INDICE DE PLAYLISTS\n"
+            
+            for playlist_name, count, path in playlists:
+                content += f"#EXTINF:-1,{playlist_name} ({count} canciones)\n"
+                content += f"{path}\n"
+            
+            index_m3u.write_text(content, encoding='utf-8', errors='ignore')
+            console.print(f"[green]📁 Índice de playlists creado con {len(playlists)} playlists[/green]")
+            
+    except Exception as e:
+        console.print(f"[yellow]⚠️ Error creando índice de playlists: {e}[/yellow]")
+
 # ---------------------- Playlists .m3u ----------------------
 
 def write_m3u_for_dir(folder: Path):
+    """Escribe un archivo M3U mejorado para una carpeta con metadatos."""
     mp3s = sorted([p for p in folder.glob("*.mp3") if p.is_file()])
     if not mp3s:
         return
+    
     m3u_path = folder / f"{folder.name}.m3u"
-    lines = [p.name for p in mp3s]
     try:
-        m3u_path.write_text("\n".join(lines), encoding="utf-8", errors="ignore")
+        # Crear contenido M3U con metadatos
+        content = "#EXTM3U\n"
+        content += f"#PLAYLIST:{folder.name}\n"
+        
+        for mp3_file in mp3s:
+            # Agregar metadatos básicos (duración estimada y nombre)
+            content += f"#EXTINF:-1,{mp3_file.stem}\n"
+            content += f"{mp3_file.name}\n"
+        
+        m3u_path.write_text(content, encoding="utf-8", errors="ignore")
+        
     except Exception as e:
-        console.print(f"[yellow]No se pudo escribir {m3u_path}:[/] {e}")
+        console.print(f"[yellow]No se pudo escribir {m3u_path}: {e}[/yellow]")
 
 def write_all_m3u(base: Path):
+    """Escribe archivos M3U para todas las carpetas de playlists."""
     for d in sorted(base.iterdir()):
         if d.is_dir() and d.name not in {"_duplicates"}:
             write_m3u_for_dir(d)
@@ -982,8 +1282,52 @@ def interactive_config_setup() -> Dict[str, Any]:
     
     return cfg
 
+def check_and_offer_resume():
+    """Verifica si hay una descarga pendiente y ofrece reanudarla."""
+    if should_resume_download():
+        state = load_download_state()
+        playlists_info = []
+        
+        for playlist_id, playlist_data in state.get("playlists", {}).items():
+            pending_tracks = sum(1 for track in playlist_data.get("tracks", {}).values() 
+                               if track.get("status") in [DownloadState.PENDING, DownloadState.DOWNLOADING, DownloadState.PAUSED])
+            if pending_tracks > 0:
+                playlists_info.append(f"• {playlist_data.get('title', 'Playlist')} ({pending_tracks} pendientes)")
+        
+        if playlists_info:
+            console.print(Panel(
+                f"🔄 [bold]Descarga pendiente detectada[/bold]\n\n"
+                f"Playlists con descargas pendientes:\n" + "\n".join(playlists_info) + "\n\n"
+                f"📁 Carpeta: {state.get('base_path', 'No especificada')}\n"
+                f"⏰ Última actualización: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(state.get('last_updated', time.time())))}",
+                title="🔄 Reanudar Descarga",
+                border_style="cyan"
+            ))
+            
+            if Confirm.ask("¿Deseas reanudar la descarga desde donde se quedó?", default=True):
+                return state
+            else:
+                if Confirm.ask("¿Limpiar el estado de descarga y empezar desde cero?", default=False):
+                    clear_download_state()
+                    console.print("[green]✅ Estado de descarga limpiado[/green]")
+    
+    return None
+
 def interactive_download():
-    """Proceso de descarga interactivo mejorado."""
+    """Proceso de descarga interactivo mejorado con capacidad de reanudación."""
+    # Verificar si hay una descarga para reanudar
+    resume_state = check_and_offer_resume()
+    
+    if resume_state:
+        # Reanudar descarga existente
+        base_path = Path(resume_state["base_path"])
+        cfg = resume_state.get("config", load_config())
+        urls = [playlist_data["url"] for playlist_data in resume_state["playlists"].values()]
+        
+        console.print(f"[cyan]🔄 Reanudando {len(urls)} playlists...[/cyan]")
+        download_playlists(urls, base_path, cfg, resume_state)
+        return
+    
     cfg = load_config()
     
     # Panel de bienvenida
@@ -1076,7 +1420,7 @@ def interactive_download():
     download_playlists(urls, selected_base, cfg)
 
 @retry_on_failure(max_retries=2, delay=1.0)  # Reducir reintentos para videos no disponibles
-def download_single_track(ydl, entry: dict, idx: int) -> Tuple[bool, str]:
+def download_single_track(ydl, entry: dict, idx: int, playlist_id: str = "") -> Tuple[bool, str]:
     """Descarga una pista individual con manejo robusto de errores."""
     title = entry.get("title") or entry.get("id") or f"item{idx}"
     
@@ -1098,6 +1442,16 @@ def download_single_track(ydl, entry: dict, idx: int) -> Tuple[bool, str]:
         return False, "Sin URL válida"
     
     try:
+        # Verificar conectividad antes de descargar
+        if not check_internet_connection():
+            console.print("[red]🌐 Sin conexión a internet. Esperando...[/red]")
+            if not wait_for_internet_connection():
+                return False, "Sin conexión a internet"
+        
+        # Verificar si la descarga debe continuar (no pausada/detenida)
+        if not download_controller.is_running():
+            return False, "Descarga pausada/detenida por el usuario"
+        
         # Realizar la descarga con información adicional en caso de éxito
         ydl.extract_info(url, download=True)
         return True, "Descargado y convertido a MP3"
@@ -1126,14 +1480,36 @@ def download_single_track(ydl, entry: dict, idx: int) -> Tuple[bool, str]:
         # Otros errores que podrían resolverse con reintentos
         raise Exception(f"Error inesperado: {str(e)[:80]}")
 
-def download_playlists(urls: List[str], base: Path, cfg: Dict[str, Any]) -> None:
-    """Descarga playlists con manejo mejorado de errores y progreso."""
+def download_playlists(urls: List[str], base: Path, cfg: Dict[str, Any], resume_state: Optional[Dict[str, Any]] = None) -> None:
+    """Descarga playlists con manejo mejorado de errores, progreso y capacidad de reanudar."""
+    
+    # Configurar manejadores de señales para control de pausa
+    setup_signal_handlers()
     
     start_time = time.time()
     total_downloaded = 0
     total_skipped = 0
     total_errors = 0
     total_unavailable_detected = 0  # Videos no disponibles detectados al leer playlists
+    
+    # Estado de descarga para reanudar
+    download_state = resume_state or {
+        "playlists": {},
+        "total_downloaded": 0,
+        "total_skipped": 0,
+        "total_errors": 0,
+        "start_time": start_time,
+        "base_path": str(base),
+        "config": cfg
+    }
+    
+    # Restaurar contadores si es una reanudación
+    if resume_state:
+        total_downloaded = download_state.get("total_downloaded", 0)
+        total_skipped = download_state.get("total_skipped", 0)
+        total_errors = download_state.get("total_errors", 0)
+        start_time = download_state.get("start_time", start_time)
+        console.print("[cyan]🔄 Reanudando descarga desde estado guardado...[/cyan]")
     
     audio_format = cfg["audio_format"]
     audio_quality = cfg["audio_quality"]
@@ -1153,9 +1529,17 @@ def download_playlists(urls: List[str], base: Path, cfg: Dict[str, Any]) -> None
         pl_task = progress.add_task("[bold blue]📦 Procesando Playlists", total=len(urls))
 
         for playlist_idx, u in enumerate(urls, 1):
+            # Verificar si debemos continuar
+            if not download_controller.is_running():
+                console.print("[yellow]⏹️ Descarga detenida por el usuario[/yellow]")
+                break
+                
             console.print("\n")
             console.rule(f"[bold blue]🎵 INICIANDO PLAYLIST {playlist_idx}/{len(urls)}[/bold blue]")
             console.print(f"[dim]URL: {u}[/dim]")
+            
+            # Generar ID único para la playlist
+            playlist_id = hashlib.md5(u.encode()).hexdigest()[:8]
             
             # 1) Extraer metadata de la playlist con configuración robusta
             try:
@@ -1211,6 +1595,20 @@ def download_playlists(urls: List[str], base: Path, cfg: Dict[str, Any]) -> None
             # Título y carpeta de la playlist
             playlist_title = info.get("title") or info.get("playlist_title") or info.get("playlist") or info.get("id") or "Playlist"
             playlist_folder = safe_name(str(playlist_title), "Playlist")
+            
+            # Inicializar estado de la playlist si no existe
+            if playlist_id not in download_state["playlists"]:
+                download_state["playlists"][playlist_id] = {
+                    "url": u,
+                    "title": playlist_title,
+                    "folder": playlist_folder,
+                    "tracks": {},
+                    "status": DownloadState.PENDING,
+                    "total_tracks": 0,
+                    "downloaded": 0,
+                    "skipped": 0,
+                    "errors": 0
+                }
             
             try:
                 out_dir = safe_path_join(base, playlist_folder)
@@ -1268,10 +1666,53 @@ def download_playlists(urls: List[str], base: Path, cfg: Dict[str, Any]) -> None
             playlist_errors = 0
             
             try:
+                # Actualizar estado de la playlist
+                playlist_state = download_state["playlists"][playlist_id]
+                playlist_state["total_tracks"] = total_tracks
+                playlist_state["status"] = DownloadState.DOWNLOADING
+                
+                # Inicializar tracks en el estado si no existen
+                for idx, entry in enumerate(entries, start=1):
+                    track_id = entry.get("id") or f"track_{idx}"
+                    if track_id not in playlist_state["tracks"]:
+                        playlist_state["tracks"][track_id] = {
+                            "title": entry.get("title") or f"Track {idx}",
+                            "url": entry.get("webpage_url") or entry.get("url") or "",
+                            "status": DownloadState.PENDING,
+                            "index": idx
+                        }
+                
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     for idx, entry in enumerate(entries, start=1):
+                        # Verificar si debemos continuar
+                        if not download_controller.is_running():
+                            console.print("[yellow]⏸️ Pausando descarga y guardando estado...[/yellow]")
+                            # Guardar estado antes de pausar
+                            download_state["total_downloaded"] = total_downloaded
+                            download_state["total_skipped"] = total_skipped
+                            download_state["total_errors"] = total_errors
+                            save_download_state(download_state)
+                            return
+                        
+                        track_id = entry.get("id") or f"track_{idx}"
+                        track_state = playlist_state["tracks"][track_id]
+                        
+                        # Saltar si ya fue descargado o procesado
+                        if track_state["status"] in [DownloadState.COMPLETED, DownloadState.SKIPPED]:
+                            if track_state["status"] == DownloadState.COMPLETED:
+                                playlist_downloaded += 1
+                                total_downloaded += 1
+                            else:
+                                playlist_skipped += 1
+                                total_skipped += 1
+                            progress.advance(track_task)
+                            continue
+                        
                         title = entry.get("title") or entry.get("id") or f"Track {idx}"
                         short_title = title[:40] + "..." if len(title) > 40 else title
+                        
+                        # Actualizar estado del track
+                        track_state["status"] = DownloadState.DOWNLOADING
                         
                         # Mostrar qué canción se está procesando actualmente
                         progress.update(track_task, description=f"🎵 Procesando: {short_title}")
@@ -1283,23 +1724,35 @@ def download_playlists(urls: List[str], base: Path, cfg: Dict[str, Any]) -> None
                             # Mostrar estado antes de descargar
                             progress.console.print(f"[dim]   🔄 Conectando y verificando disponibilidad...[/dim]")
                             
-                            success, message = download_single_track(ydl, entry, idx)
+                            success, message = download_single_track(ydl, entry, idx, playlist_id)
                             
                             if success:
                                 progress.console.print(f"[green]   ✅ DESCARGADO: {title}[/green]")
+                                track_state["status"] = DownloadState.COMPLETED
                                 playlist_downloaded += 1
                                 total_downloaded += 1
                             else:
                                 progress.console.print(f"[yellow]   ⏭️ OMITIDO: {title}[/yellow]")
                                 progress.console.print(f"[yellow]   📝 Razón: {message}[/yellow]")
+                                track_state["status"] = DownloadState.SKIPPED
                                 playlist_skipped += 1
                                 total_skipped += 1
                         except Exception as e:
                             progress.console.print(f"[red]   ❌ ERROR: {title}[/red]")
                             progress.console.print(f"[red]   📝 Detalle: {str(e)[:80]}...[/red]")
+                            track_state["status"] = DownloadState.ERROR
                             playlist_errors += 1
                             total_errors += 1
                         finally:
+                            # Guardar estado después de cada track
+                            playlist_state["downloaded"] = playlist_downloaded
+                            playlist_state["skipped"] = playlist_skipped
+                            playlist_state["errors"] = playlist_errors
+                            download_state["total_downloaded"] = total_downloaded
+                            download_state["total_skipped"] = total_skipped
+                            download_state["total_errors"] = total_errors
+                            save_download_state(download_state)
+                            
                             # Actualizar barra de progreso
                             progress.advance(track_task)
                             # Mostrar progreso actual de la playlist
@@ -1321,6 +1774,9 @@ def download_playlists(urls: List[str], base: Path, cfg: Dict[str, Any]) -> None
 
             # 4) Post-procesado de la playlist
             try:
+                # Marcar playlist como completada
+                playlist_state["status"] = DownloadState.COMPLETED
+                
                 # Generar archivo .m3u si está habilitado
                 if cfg.get("generate_m3u", True) and playlist_downloaded > 0:
                     write_m3u_for_dir(out_dir)
@@ -1338,9 +1794,36 @@ def download_playlists(urls: List[str], base: Path, cfg: Dict[str, Any]) -> None
             console.print(f"[green]🗂️ Se movieron {duplicates_moved} archivos duplicados[/green]")
     except Exception as e:
         console.print(f"[yellow]⚠️ Error en deduplicación: {e}[/yellow]")
+    
+    # Actualizar todos los archivos M3U al final
+    if cfg.get("generate_m3u", True):
+        try:
+            console.print("\n[cyan]📝 Actualizando archivos M3U finales...[/cyan]")
+            update_all_m3u_files(base)
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Error actualizando M3U finales: {e}[/yellow]")
 
     # Mostrar resumen final con información completa
     show_download_summary_enhanced(base, total_downloaded, total_skipped, total_errors, total_unavailable_detected, start_time)
+    
+    # Limpiar estado si la descarga se completó exitosamente
+    if not download_controller.should_stop and not download_controller.paused:
+        clear_download_state()
+        console.print("[green]✅ Estado de descarga limpiado (descarga completada)[/green]")
+        
+        # Mostrar información sobre archivos M3U creados
+        if cfg.get("generate_m3u", True) and total_downloaded > 0:
+            m3u_files = list(base.glob("*.m3u"))
+            if m3u_files:
+                console.print(Panel(
+                    f"🎵 [bold]Archivos M3U creados:[/bold]\n\n"
+                    f"• todas_las_canciones.m3u - Todas las canciones en un solo archivo\n"
+                    f"• indice_playlists.m3u - Índice de todas las playlists\n"
+                    f"• [Carpeta]/[Carpeta].m3u - M3U individual por playlist\n\n"
+                    f"📝 Total de archivos M3U: {len(m3u_files)}",
+                    title="🎵 Archivos M3U",
+                    border_style="green"
+                ))
 
 # ---------------------- Typer commands (modo script) ----------------------
 
@@ -1350,10 +1833,29 @@ def download(
     output: Optional[Path] = Option(None, "-o", "--output", help="Carpeta base de salida (ej. tu USB)."),
     no_m3u: bool = Option(False, "--no-m3u", help="No generar listas .m3u por carpeta."),
     interactive_config: bool = Option(False, "--config", help="Ejecutar configuración interactiva antes de descargar."),
+    resume: bool = Option(False, "--resume", "-r", help="Reanudar descarga desde estado guardado."),
+    force_new: bool = Option(False, "--force-new", help="Forzar nueva descarga (ignorar estado guardado)."),
 ):
     """Comando principal de descarga con mejoras."""
     
     try:
+        # Manejar reanudación o nueva descarga
+        if force_new:
+            clear_download_state()
+            console.print("[green]✅ Estado de descarga limpiado[/green]")
+        elif resume or should_resume_download():
+            resume_state = load_download_state()
+            if resume_state:
+                base_path = Path(resume_state["base_path"])
+                cfg = resume_state.get("config", load_config())
+                urls = [playlist_data["url"] for playlist_data in resume_state["playlists"].values()]
+                
+                console.print(f"[cyan]🔄 Reanudando {len(urls)} playlists desde estado guardado...[/cyan]")
+                download_playlists(urls, base_path, cfg, resume_state)
+                return
+            else:
+                console.print("[yellow]⚠️ No hay estado de descarga para reanudar[/yellow]")
+        
         cfg = load_config()
         
         # Configuración interactiva si se solicita
@@ -1653,6 +2155,10 @@ def show_about_info() -> None:
 def show_enhanced_menu():
     """Menú principal mejorado con iconos y mejor organización."""
     
+    # Verificar si hay descarga para reanudar
+    resume_available = should_resume_download()
+    resume_indicator = " [bold red](Descarga pendiente)[/bold red]" if resume_available else ""
+    
     # Logo con efectos
     logo_panel = Panel(
         Align.center(
@@ -1667,13 +2173,14 @@ def show_enhanced_menu():
     
     # Menú con iconos y descripciones
     menu_options = [
-        ("1", "🚀", "Descargar playlists", "Descarga asistida con progreso visual"),
+        ("1", "🚀", f"Descargar playlists{resume_indicator}", "Descarga asistida con progreso visual"),
         ("2", "🔧", "Verificar sistema", "Comprobar dependencias (ffmpeg, yt-dlp)"),
         ("3", "💾", "Detectar USB", "Buscar y seleccionar unidad de almacenamiento"),
         ("4", "⚙️", "Configuración", "Ajustar preferencias y valores por defecto"),
         ("5", "🔍", "Duplicados", "Buscar y gestionar archivos duplicados"),
         ("6", "📊", "Estadísticas", "Ver información de archivos descargados"),
-        ("7", "ℹ️", "Información", "Acerca de la aplicación"),
+        ("7", "🔄", "Estado descarga", "Ver/gestionar estado de descarga"),
+        ("8", "ℹ️", "Información", "Acerca de la aplicación"),
         ("0", "🚪", "Salir", "Cerrar la aplicación")
     ]
     
@@ -1702,7 +2209,7 @@ def show_menu():
     while True:
         show_enhanced_menu()
         
-        choice = Prompt.ask("Selecciona", choices=["1","2","3","4","5","6","7","0"], default="1")
+        choice = Prompt.ask("Selecciona", choices=["1","2","3","4","5","6","7","8","0"], default="1")
         if choice == "1":
             interactive_download()
         elif choice == "2":
@@ -1739,6 +2246,62 @@ def show_menu():
             cfg = load_config()
             show_system_statistics(cfg)
         elif choice == "7":
+            # Gestión de estado de descarga
+            state_data = load_download_state()
+            if not state_data:
+                console.print(Panel(
+                    "✅ [bold]No hay estado de descarga activo[/bold]\n\n"
+                    "No hay descargas pendientes o pausadas.",
+                    title="📊 Estado de Descarga",
+                    border_style="green"
+                ))
+            else:
+                # Mostrar opciones de gestión
+                console.print(Panel(
+                    "🔄 [bold]Gestión de Estado de Descarga[/bold]\n\n"
+                    "1. Ver estado detallado\n"
+                    "2. Reanudar descarga\n"
+                    "3. Limpiar estado",
+                    title="🔄 Opciones",
+                    border_style="cyan"
+                ))
+                
+                state_choice = Prompt.ask("Selecciona opción", choices=["1", "2", "3"], default="1")
+                
+                if state_choice == "1":
+                    # Mostrar estado detallado
+                    table = Table(title="📊 Estado de Descarga", box=box.ROUNDED)
+                    table.add_column("Información", style="cyan")
+                    table.add_column("Valor", style="bold green")
+                    
+                    table.add_row("📁 Carpeta base", state_data.get("base_path", "No especificada"))
+                    table.add_row("📊 Total descargados", str(state_data.get("total_downloaded", 0)))
+                    table.add_row("⏭️ Total omitidos", str(state_data.get("total_skipped", 0)))
+                    table.add_row("❌ Total errores", str(state_data.get("total_errors", 0)))
+                    table.add_row("⏰ Última actualización", 
+                                 time.strftime('%Y-%m-%d %H:%M:%S', 
+                                              time.localtime(state_data.get('last_updated', time.time()))))
+                    
+                    console.print(table)
+                    
+                elif state_choice == "2":
+                    # Reanudar descarga
+                    base_path = Path(state_data["base_path"])
+                    cfg = state_data.get("config", load_config())
+                    urls = [playlist_data["url"] for playlist_data in state_data["playlists"].values()]
+                    
+                    console.print(f"[cyan]🔄 Reanudando {len(urls)} playlists...[/cyan]")
+                    download_playlists(urls, base_path, cfg, state_data)
+                    
+                elif state_choice == "3":
+                    # Limpiar estado
+                    if Confirm.ask("¿Estás seguro de que quieres limpiar el estado?", default=False):
+                        if clear_download_state():
+                            console.print("[green]✅ Estado de descarga limpiado[/green]")
+                        else:
+                            console.print("[red]❌ Error limpiando el estado[/red]")
+                            
+        elif choice == "8":
             show_about_info()
         elif choice == "0":
             console.print("Hasta luego 👋")
@@ -1759,6 +2322,79 @@ def stats(
         
     except Exception as e:
         console.print(f"[red]❌ Error generando estadísticas: {e}[/red]")
+        raise typer.Exit(1)
+
+# Comandos para manejo de estado
+@app.command(help="Gestiona el estado de descarga (pausar, reanudar, limpiar).")
+def state(
+    action: str = Argument(help="Acción: resume, clear, status"),
+):
+    """Gestiona el estado de descarga."""
+    try:
+        if action == "resume":
+            if should_resume_download():
+                resume_state = load_download_state()
+                base_path = Path(resume_state["base_path"])
+                cfg = resume_state.get("config", load_config())
+                urls = [playlist_data["url"] for playlist_data in resume_state["playlists"].values()]
+                
+                console.print(f"[cyan]🔄 Reanudando {len(urls)} playlists...[/cyan]")
+                download_playlists(urls, base_path, cfg, resume_state)
+            else:
+                console.print("[yellow]⚠️ No hay estado de descarga para reanudar[/yellow]")
+                
+        elif action == "clear":
+            if clear_download_state():
+                console.print("[green]✅ Estado de descarga limpiado[/green]")
+            else:
+                console.print("[red]❌ Error limpiando el estado[/red]")
+                
+        elif action == "status":
+            state_data = load_download_state()
+            if not state_data:
+                console.print("[green]✅ No hay estado de descarga activo[/green]")
+                return
+                
+            # Mostrar información del estado
+            table = Table(title="📊 Estado de Descarga", box=box.ROUNDED)
+            table.add_column("Información", style="cyan")
+            table.add_column("Valor", style="bold green")
+            
+            table.add_row("📁 Carpeta base", state_data.get("base_path", "No especificada"))
+            table.add_row("📊 Total descargados", str(state_data.get("total_downloaded", 0)))
+            table.add_row("⏭️ Total omitidos", str(state_data.get("total_skipped", 0)))
+            table.add_row("❌ Total errores", str(state_data.get("total_errors", 0)))
+            table.add_row("⏰ Última actualización", 
+                         time.strftime('%Y-%m-%d %H:%M:%S', 
+                                      time.localtime(state_data.get('last_updated', time.time()))))
+            
+            console.print(table)
+            
+            # Mostrar playlists
+            playlists = state_data.get("playlists", {})
+            if playlists:
+                playlist_table = Table(title="🎵 Estado de Playlists", box=box.ROUNDED)
+                playlist_table.add_column("Playlist", style="blue")
+                playlist_table.add_column("Estado", style="green")
+                playlist_table.add_column("Progreso", style="yellow")
+                
+                for playlist_data in playlists.values():
+                    title = playlist_data.get("title", "Sin título")[:40]
+                    status = playlist_data.get("status", "unknown")
+                    total = playlist_data.get("total_tracks", 0)
+                    downloaded = playlist_data.get("downloaded", 0)
+                    
+                    playlist_table.add_row(title, status, f"{downloaded}/{total}")
+                
+                console.print("\n")
+                console.print(playlist_table)
+                
+        else:
+            console.print("[red]❌ Acción inválida. Usa: resume, clear, status[/red]")
+            raise typer.Exit(1)
+            
+    except Exception as e:
+        console.print(f"[red]❌ Error en gestión de estado: {e}[/red]")
         raise typer.Exit(1)
 
 # Comando de ayuda mejorado
